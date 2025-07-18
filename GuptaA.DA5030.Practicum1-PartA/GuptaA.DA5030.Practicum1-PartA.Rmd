@@ -1,0 +1,460 @@
+---
+title: "Practicum I"
+author: "Gupta, Ankur"
+date: "Summer 2025"
+output:
+  html_document:
+    df_print: paged
+subtitle: DA5030 / kNN Classification
+---
+```{r LoadLibraries}
+
+packages <- c("caret", "gmodels", "class")
+
+# install packages not yet installed
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+# load all packages by applying 'library' function
+invisible(lapply(packages, function(pkg) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}))
+```
+
+
+## Part B // Load Training and Validation Data
+```{r LoadData}
+
+url.training <- "https://s3.us-east-2.amazonaws.com/artificium.us/datasets/fertilizer-recommendation.csv"
+url.testing <- "https://s3.us-east-2.amazonaws.com/artificium.us/datasets/fertilizer-recommendation-validation.csv"
+
+df.raw <- read.csv(url.training,
+                        header=T,
+                        stringsAsFactors = F)
+df.raw_test <- read.csv(url.testing,
+                        header=T,
+                        stringsAsFactors = F)
+
+```
+
+## Part C // Explore Data
+
+```{r ExploreTraining}
+# Training Data
+head(df.raw, 5)
+str(df.raw)
+
+
+```
+There are a total of `r ncol(df.raw)` columns and `r nrow(df.raw)` rows in the dataset. All columns are numeric, except for 'Soil' and 'Crop'. The unnecessary columns 'Remark' and 'X' columns will be removed.
+```{r RemovingColumns}
+df <- df.raw[, -c(1, 13)]
+```
+
+
+### Determining Missing Values
+The data will be explored to determine if there are any missing values or not.
+```{r DetermineMissingValues}
+# Function that prints  which determines which columns has missing values
+for (col_name in names(df)) {
+
+  num_missing <- sum(is.na(df[col_name]))
+  cat(paste0(col_name," has ", num_missing, " missing values\n"))
+
+  }
+
+
+```
+Only column 'PH' has missing values totaling to `r length(which(is.na(df["PH"])))` values. Given that there are very few rows with missing values relative to the entire dataset, `r length(which(is.na(df["PH"])))` vs to `r nrow(df)`, we can either simply remove these rows from the data set, or impute them. 
+
+Before we determine which approach we take, we will determine if the values are missing at random or not at random.
+
+### Assessing Randomness of Missing Values
+```{r T.TestForMissingValues}
+
+# T-test to compare missing vs non-missing values
+
+columns_to_test <- setdiff(colnames(df), "PH")
+Missing <- is.na(df["PH"])
+
+for (i in seq_along(columns_to_test)) {
+  col_name <- columns_to_test[i]
+  
+  if (is.numeric(df[[col_name]])) {
+    result <- t.test(df[[col_name]] ~ Missing)
+    
+  cat(paste0(col_name, ": ", result$p.value, "\n"))
+  }
+}
+
+
+
+```
+
+There appears to be no numeric features that are correlated with the missing values. As such, given the low number of missing values (`r length(which(is.na(df["PH"])))` compared to `r nrow(df)` total rows), we will elect to remove these rows that contain missing values.
+```{r RemovingMissingRows}
+df.clean <- df[!Missing, ]
+```
+### Assessing Categorical Features
+As mentioned previously, there are two categorical features, 'Soil' and 'Crop' (aside from our fertilizer column). We will determine the number of variables in each of these features below:
+```{r ExploringCategoricalFeatures}
+
+soil <- table(df.clean['Soil'])
+soil
+length(soil)
+
+crop <- table(df.clean['Crop'])
+crop
+length(crop)
+
+
+```
+
+There are `r length(soil)` soil types with three types having very similar frequency, and two having very different frequencies. As such, it may be possible to do a one-hot encoding or frequency encoding for soil type.
+
+Comparatively, there are `r length(crop)` crop types, making one-hot encoding potentially problematic by adding too many additional features. Additionally, the the frequency of each crop is extremely similar, making frequency encoding potentially problematic as it would not distinguish between each crop.
+
+For both features, we will determine if they can be dropped by performing a chi-squared analysis, using motecarl simulations to off-set the low counts.
+
+```{r ChisqCategoricalData}
+# Soil Type
+Soil_Fertilizer <- table(df.clean$Soil, df.clean$Fertilizer)
+chisq.test(Soil_Fertilizer, simulate.p.value = TRUE, B = 2000)
+
+
+#Crop Type
+Crop_Fertilizer <- table(df.clean$Crop, df.clean$Fertilizer)
+chisq.test(Crop_Fertilizer, simulate.p.value = TRUE, B = 2000)
+
+```
+
+Given the results, both Soil and Crop types are strongly correlated with Fertilizer. As such, these features should be included in the KNN modeling by one-hot encoding method.
+
+## Part D // Shaping Data for kNN
+
+To shape the data for a kNN model, we will need to complete several steps:
+
+1. Scale features using z-score
+2. Encode categorical features (Soil, Crop)
+3. Assess and remove outliers based upon z-score
+4. Split into training and validating data sets
+
+Missing values have already been excluded in the exploratory step
+
+###  Step 1 - Normalize each non-categorical feature using Z-score
+```{r Normalization}
+df.encoded <- df.clean
+# Select columns except Fertilizer and Categorical features
+cols_to_scale <- setdiff(names(df.encoded), c("Fertilizer", "Soil", "Crop"))
+
+df.encoded[cols_to_scale] <- scale(df.encoded[cols_to_scale])
+
+# Checking Scaling
+summary(df.encoded[,1:8])
+
+fertilizer <- df.clean$Fertilizer
+```
+
+
+
+###  Step 2 - Encode Categorical Feature Soil and Crop
+We will start off by encoding the Soil feature using a one-hot method.
+```{r EncodeCategoricalFeature}
+
+# We are acquiring a list of soil types for applying the model.matrix function for the test data set.
+soil_types <- unique(df.clean$Soil)
+df.encoded$Soil <- factor(df.encoded$Soil, levels = soil_types)
+
+# Apply matrix and create additional columns
+soil_encoded <- model.matrix(~ Soil - 1, data = df.encoded)
+df.encoded <- cbind(df.encoded, soil_encoded)
+
+# We are acquiring a list of crop types for applying the model.matrix function for the test data set.
+crop_types <- unique(df.clean$Crop)
+df.encoded$Crop <- factor(df.encoded$Crop, levels = crop_types)
+
+# Apply matrix and create additional columns
+crop_encoded <- model.matrix(~ Crop - 1, data = df.encoded)
+df.encoded <- cbind(df.encoded, crop_encoded)
+
+# Remove original crop and soil columns
+df.encoded$Crop <- NULL
+df.encoded$Soil <- NULL
+
+```
+
+
+### Step 3 - Assess and remove outliers based upon z-score
+```{r Outliers}
+# Get the column index of Fertilizer
+fertilizer_col <- which(names(df.encoded) == "Fertilizer")
+
+# Logical matrix: TRUE where abs(z) > 3
+logical_matrix <- abs(df.encoded[, -fertilizer_col]) > 3
+
+# Identify rows with at least one TRUE
+outlier_rows <- which(rowSums(logical_matrix) > 0)  # Only 54 rows considered outliers
+
+df.clean <- df.encoded[-outlier_rows, ]
+df.clean$Fertilizer <- fertilizer[-outlier_rows]
+head(df.clean, 5)
+
+summary(df.clean[,1:8])
+```
+Now the data as been appropiately scaled and outliers have been removed.
+
+### Step 4 - Splitting into training and validating data
+Now the data has been shaped, it will be split into a training and validating data set.
+```{r SplitDataSet}
+
+# Create a stratified split
+train_index <- createDataPartition(df.clean$Fertilizer, p = 0.8, list = FALSE)
+
+# Split into training and validation sets
+df.train <- df.clean[train_index, ]
+df.val <- df.clean[-train_index, ]
+```
+
+## Part 5 // Train a kNN Model
+
+In order to determine the best k value, we will iterate through from 1~35. We will start by creating functions to test multiple k-values and determine its accuracy.
+### Validating Model
+```{r kNNFunctions}
+# Create function to test models:
+evaluate_model <- function(true_labels, predicted_labels) {
+  # Suppress CrossTable output
+  cm <- capture.output(
+    ct <- CrossTable(x = true_labels, 
+                     y = predicted_labels,
+                     prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+                     dnn = c("Actual", "Predicted"))
+  )
+  
+  # Extract confusion matrix
+  cm_table <- ct$t
+  total_samples <- sum(cm_table)
+  
+  # Accuracy
+  accuracy <- sum(diag(cm_table)) / total_samples
+  
+  # True positives as proportion
+  true_positives <- sum(diag(cm_table)) / total_samples
+  
+  # True negatives as proportion (everything else except TP)
+  true_negatives <- (total_samples - sum(diag(cm_table))) / total_samples
+  
+  return(list(
+    accuracy = accuracy,
+    true_positives = true_positives,
+    true_negatives = true_negatives,
+    confusion_matrix = cm_table
+  ))
+}
+
+# Function to test multiple k values
+test_knn_models <- function(train_data, train_labels, test_data, test_labels, k_values) {
+  results <- data.frame(k = integer(), accuracy = numeric())
+
+  for (k in k_values) {
+    # Predict using kNN
+    predicted <- knn(train = train_data, test = test_data, cl = train_labels, k = k)
+    
+    # Evaluate model
+    eval_result <- evaluate_model(true_labels = test_labels, predicted_labels = predicted)
+    
+    # Store accuracy
+    results <- rbind(results, data.frame(k = k, accuracy = eval_result$accuracy))
+  }
+
+  return(results)
+}
+
+```
+
+Next, we will determine and plot the accuracy for k values between 1~35
+```{r TrainkNNModel}
+# Acquire index for fertilizer to use with model
+fertilizer_index.train <- which(colnames(df.train) == "Fertilizer")
+fertilizer_index.val <- which(colnames(df.val) == "Fertilizer")
+
+# Evaluate
+k_range <- 1:35
+
+# Run kNN evaluation
+knn_results <- test_knn_models(df.train[-fertilizer_index.train], 
+                               df.train$Fertilizer, 
+                               df.val[-fertilizer_index.val], 
+                               df.val$Fertilizer, 
+                               k_range)
+
+# View results
+plot(knn_results$k, knn_results$accuracy, 
+     type = "o", col = "blue", lwd = 2,
+     xlab = "Number of Neighbors (k)", 
+     ylab = "Accuracy", 
+     main = "kNN Accuracy vs. k")
+grid()
+
+```
+Based upon testing K values from 1~35 and rerunning it multiple times, the best k value varies tremendously depending upon how the model determines ties. This variance, however, is isolated between k=27 and k=35. Further, we can see a decline in accuracy prior to k=35, meaning that this range is adequeately encompasing the most accurate model.
+
+There are various solutions:
+
+1. We can use a kNN function that uses weights like from the library(kknn) package. However, this solution is not completely free of problems as it does not consistently determine how ties are decided. Regardless, we cannot use the kknn package for this project.
+2. We can run the model several times and take an average. Running the model several times will work if the more accurate tie breaking occurs significantly more frequently. However, if it does not, the average will be extremely low.
+3. We can identify the most stable k value and choose that. This will work if the accuracy of the most stable k value is similar to that of the highest recorded unstable k value. If not is not similar, the model would be not as optimal as possible
+
+In order to determine if we take eiter solution 2 and 3, we will run the model 50 times and determine the highest average. We will restrict this to 15<k<30.
+
+```{r EstablishingKValue}
+k_values <- 15:29
+
+# Create an empty matrix to store accuracies (rows = repetitions, columns = k values)
+accuracy_matrix <- matrix(NA, nrow = 50, ncol = length(k_values))
+colnames(accuracy_matrix) <- as.character(k_values)
+
+# Loop 100 times
+for (i in 1:50) {
+  # Run kNN for this iteration
+  results <- test_knn_models(
+    train_data = df.train[-fertilizer_index.train],
+    train_labels = df.train$Fertilizer,
+    test_data = df.val[-fertilizer_index.val],
+    test_labels = df.val$Fertilizer,
+    k_values = k_values
+  )
+  
+  # Store accuracies in matrix
+  accuracy_matrix[i, ] <- results$accuracy
+}
+
+# Compute average accuracy across 50 iterations
+mean_accuracies <- colMeans(accuracy_matrix)
+
+# Convert to a data frame
+average_accuracy_df <- data.frame(
+  k = k_values,
+  mean_accuracy = mean_accuracies
+)
+
+# View result
+head(average_accuracy_df, 5)
+max_k <- average_accuracy_df$k[which.max(average_accuracy_df$mean_accuracy)]
+```
+By iterating over 50 times, we establish that k=`r max_k` gives the highest overall accuracy of `r max(average_accuracy_df$mean_accuracy)`. As such, we will use `r max_k` for all models.
+
+```{r EstablishkNNModel}
+# Using K value providing highest overall accuracy rate of k=24:
+
+model <- knn(train = df.train[-fertilizer_index.train], 
+             test = df.val[-fertilizer_index.val], 
+             cl = df.train$Fertilizer, 
+             k = max_k)
+
+results <- evaluate_model(true_labels = df.val$Fertilizer, 
+                               predicted_labels = model)
+results$accuracy
+```
+
+
+The kNN algorithm exhibits an overall accuracy of `r results$accuracy`%.
+
+## Part F / Validate Model
+Before we apply or kNN model to our test data, we need to inspect it, clean it, and shape it.
+### Inspecting Test Data
+```{r InspectTrainData}
+str(df.raw_test)
+head(df.raw_test, 5)
+```
+The data appears similar to our training data, except for the lack of Fertilizer and Remark columns.
+
+### Shaping Testing Data
+
+#### Missing Values
+```{r IdentifyMissingTestData}
+for (col_name in names(df.raw_test)) {
+
+  num_missing <- sum(is.na(df.raw_test[col_name]))
+  cat(paste0(col_name," has ", num_missing, " missing values\n"))
+
+  }
+
+```
+We have identified that a single row has missing PH data. In our training data set, we were able to remove rows that lacked pH values. However, with our testing data set, it is not ideal to remove any rows. Consequently, we will impute its value using the average.
+
+```{r ImputeMissingValues}
+average_ph <- mean(df.raw_test$PH, na.rm = TRUE)
+df.clean_test <- df.raw_test
+
+df.clean_test[which(is.na(df.raw_test$PH))[1], "PH"] <- average_ph
+
+```
+
+#### Normalization using Z-score
+```{r NormalizeTestData}
+scale_cols <- setdiff(names(df.clean_test), c("X", "Soil", "Crop"))
+
+# Create a copy of the dataframe
+df.scaled_test <- df.clean_test
+
+# Apply scaling only to selected columns
+df.scaled_test[ , scale_cols] <- scale(df.clean_test[ , scale_cols])
+
+#Inspect scaled Values
+head(df.scaled_test, 5)
+```
+#### Assessing Outliers
+```{r AssessOutliers}
+# Identify rows with any value > 3 or < -3 in the scaled columns
+summary(df.scaled_test)
+
+# Keep only rows without outliers
+df.cleaned_test <- df.scaled_test
+```
+There appears to be a few outliers using a z=3.0 threshold. However, given that we need to make predictions for this data, we will only impute the outliers if they are obviously extremely high such as a z-score of 25. Given that the highest z-score is below 4 in all columns, we will make predictions with these values.
+#### One-hot encoding for Soil and Crop columns
+```{r EncodeCategoricalFeaturesTest}
+df.encoded_test <- df.cleaned_test
+# We are acquiring a list of soil types for applying the model.matrix function for the test data set.
+soil_types <- unique(df.cleaned_test$Soil)
+df.encoded_test$Soil <- factor(df.encoded_test$Soil, levels = soil_types)
+
+# Apply matrix and create additional columns
+soil_encoded <- model.matrix(~ Soil - 1, data = df.encoded_test)
+df.encoded_test <- cbind(df.encoded_test, soil_encoded)
+
+
+# We are acquiring a list of crop types for applying the model.matrix function for the test data set.
+crop_types <- unique(df.cleaned_test$Crop)
+df.encoded_test$Crop <- factor(df.encoded_test$Crop, levels = crop_types)
+
+# Apply matrix and create additional columns
+crop_encoded <- model.matrix(~ Crop - 1, data = df.encoded_test)
+df.encoded_test <- cbind(df.encoded_test, crop_encoded)
+
+# Remove original crop and soil columns
+df.encoded_test$Crop <- NULL
+df.encoded_test$Soil <- NULL
+
+#Inspect encoded and normalized test data
+head(df.encoded_test, 5)
+```
+
+
+### Predict Fertilizer Values and Save CSV Prediction File
+```{r MakePredictionsCSV}
+predictions <- knn(train = df.train[-fertilizer_index.train], 
+             test = df.encoded_test[-1], # Remove column x
+             cl = df.train$Fertilizer, 
+             k = max_k)
+
+# Create dataframe of X and fertilizer predictions
+df_predictions <- data.frame( X = df.encoded_test$X,
+                              Fertilizer <- predictions)
+
+# Save csv file locally
+write.csv(df_predictions, file = "GuptaA.kNN-Predictions.csv", row.names = FALSE)
+```
+

@@ -1,0 +1,109 @@
+---
+title: "DA5030 kNN"
+author: "Gupta, Ankur"
+date: "06/02/2025"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+## Load CSV
+```{r LoadCSV, echo=F}
+df <- read.csv("https://s3.us-east-2.amazonaws.com/artificium.us/datasets/DiabetesDatasetWithMissingValues.csv",
+               header = TRUE,
+               stringsAsFactors = FALSE)
+head(df, 5)
+
+```
+
+
+## Impute Missing Values
+```{r ImputeMissingBMI, echo=F}
+
+trimmed_bmi_f <- mean(df$bmi[df$gender == "Female"], trim = .10, na.rm = TRUE)
+trimmed_bmi_m <- mean(df$bmi[df$gender == "Male"], trim = .10, na.rm = TRUE)
+
+df$bmi[is.na(df$bmi) & df$gender == "Female"] <- trimmed_bmi_f
+df$bmi[is.na(df$bmi) & df$gender == "Male"] <- trimmed_bmi_m
+
+
+
+```
+## Encoding Categorical Features (gender, smoking_history)
+```{r EncodingCategoricalFeatures, echo=F}
+# Encoding Gender using one-hot
+df.encoded <- df
+df.encoded$Male <- as.numeric(df$gender == "Male")
+df.encoded$Female <- as.numeric(df$gender == "Female")
+
+# Encoding smoking_history using frequency
+smoking_frequency <- table(df$smoking_history)
+df.encoded$smoking_history <- as.numeric(smoking_frequency[df$smoking_history])
+
+df.encoded <- df.encoded[, !(names(df.encoded) %in% "gender")]
+
+
+```
+
+## Normalizing Numeric Features
+```{r Normalization, echo=F}
+
+cols_to_normalize <- setdiff(names(df.encoded), "diabetes")
+df.norm <- as.data.frame(scale(df.encoded[cols_to_normalize]))
+df.norm$diabetes <- df.encoded$diabetes
+
+```
+
+## Creating Training and Validating Datasets
+```{r TrainingAndValidating, echo=F}
+library(caret)
+
+set.seed(123)  # For reproducibility
+
+# Create stratified partition
+train_indices <- createDataPartition(df.norm$diabetes, p = 0.8, list = FALSE)
+# Split data
+df.train <- df.norm[train_indices, ]
+df.val   <- df.norm[-train_indices, ]
+```
+## Assessing Target Variable in Data Sets
+```{r TargetVariableProportions, echo=F}
+original_prop <- prop.table(table(df[["diabetes"]])) *100
+train_prop <- prop.table(table(df.train[["diabetes"]])) *100
+val_prop <- prop.table(table(df.val[["diabetes"]])) *100
+
+
+```
+The target variables have similar proportions in original, training, and validating datasets with `r original_prop[2]`%, `r train_prop[2]`%, and `r val_prop[2]`% containing diabetes, respectively. The proportions of diabetes cases in both the training and validation sets are very close to that of the original dataset. This indicates that the sampling method used to split the data preserved the class distribution effectively across the subsets. 
+
+## Creating Model
+```{r CreatingModel, echo=F}
+library(class)
+
+dia_index.train <- which(colnames(df.train) == "diabetes")
+
+dia_index.val <- which(colnames(df.val) == "diabetes")
+
+model <- knn(train = df.train[-dia_index.train], 
+             test = df.val[-dia_index.val], 
+             cl = df.train$diabetes, 
+             k = 5)
+
+
+```
+## Confusion Matrix of Model
+```{r ConfusionMatrix, echo=F}
+library(gmodels)
+confusion_matrix <- CrossTable(x = df.val$diabetes, 
+           y = model,
+           prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+           dnn = c("Actual", "Predicted"))
+
+total <- sum(confusion_matrix$prop.tbl)
+accuracy <- confusion_matrix$prop.tbl[1,1] + confusion_matrix$prop.tbl[2,2]
+true_positive <- confusion_matrix$prop.row[2,2]
+true_negative <- confusion_matrix$prop.row[1,1]
+
+```
+The kNN algorithm exhibits an overall accuracy of `r accuracy`%, with a true positive rate of `r true_positive` and a true negative rate of `r true_negative`%.

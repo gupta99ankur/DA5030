@@ -1,0 +1,133 @@
+---
+title: "DA5030 Naive Bayes"
+author: "Gupta, Ankur"
+date: "06/15/2025"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Part 2 // Load CSV File
+
+```{r LoadCSV}
+df <- read.csv("https://s3.us-east-2.amazonaws.com/artificium.us/datasets/HouseVotes-1984-ButOne.csv",
+               stringsAsFactors = F,
+               header = T)
+
+head(df, 5)
+```
+
+## Part 3 // Create Samples of Data
+```{r CreateFiveTrainingSets}
+training_data <- list()
+validation_data <- list()
+
+df.indices <- 1:nrow(df)
+
+for (i in 1:5){
+  
+  val_start <- (i - 1) * 84 + 1
+  val_end <- i * 84
+  
+  validation_indices <- val_start:val_end
+  
+  validation_data[[i]] <- df[validation_indices, ]
+  training_data[[i]] <- df[setdiff(df.indices, validation_indices), ]
+
+}
+
+```
+
+## Part 4 // Training Naives Bayes Models
+```{r NaivesBayesModels}
+library(e1071)
+
+nb_models <- list()
+
+for (i in 1:5) {
+  nb_models[[i]] <- naiveBayes(Class ~ ., data = training_data[[i]])
+  
+}
+
+```
+
+## Part 5 // Building Ensemble Fuction
+```{r EnsembleFunction}
+
+predict_party <- function(models, new_cases) {
+  n_rows <- nrow(new_cases)
+  n_models <- length(models)
+  final_predictions <- character(n_rows)
+  
+  for (i in 1:(n_rows)) {
+    row <- new_cases[i, , drop = FALSE]
+    preds <- character(n_models)
+
+    for (j in 1:(n_models)) {
+      preds[j] <- as.character(predict(models[[j]], newdata = row))
+
+    }
+    
+    final_predictions[i] <- names(which.max(table(as.character(preds))))
+
+  }
+  
+  return(final_predictions)
+}
+```
+
+## Part 6 // Validating Model
+
+```{r ValidatingModel}
+# For loop for to test each validation dataset
+
+validation_data_predictions <- list()
+predictions <- list()
+
+for (i in 1:5) {
+  predictions[[i]] <- predict_party(nb_models, as.data.frame(validation_data[[i]][, -1]))
+}
+
+
+accuracies <- numeric(5)
+tpr <- numeric(5)  # true positive rate = sensitivity = TP / (TP + FN)
+tnr <- numeric(5)  # true negative rate = specificity = TN / (TN + FP)
+
+for (i in 1:5) {
+  true_labels <- validation_data[[i]]$Class
+  pred_labels <- predictions[[i]]
+  
+  tp <- sum(pred_labels == "democrat" & true_labels == "democrat")
+  tn <- sum(pred_labels == "republican" & true_labels == "republican")
+  fp <- sum(pred_labels == "democrat" & true_labels == "republican")
+  fn <- sum(pred_labels == "republican" & true_labels == "democrat")
+  
+  accuracies[i] <- mean(pred_labels == true_labels)
+  tpr[i] <- if ((tp + fn) > 0) tp / (tp + fn) else NA
+  tnr[i] <- if ((tn + fp) > 0) tn / (tn + fp) else NA
+}
+
+# Average all stats for final assessment
+overall_results <- data.frame(
+  Accuracy = round(mean(accuracies), 4),
+  True_Positive = round(mean(tpr), 4),
+  True_Negative = round(mean(tnr), 4)
+)
+
+print(overall_results)
+
+```
+
+## Part 7 // Guess Vote
+```{r GuessVote}
+headers <- c("V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11", "V12", "V13", "V14", "V15", "V16")
+
+data <- c("n", "y", "n", "n", "y", "y", "y", "n", "n", "y", "n", "y", "y", "y", NA, "n")
+
+random_vote_df <- as.data.frame(t(data), 
+                                stringsAsFactors = FALSE,
+                                colnames <- headers)
+
+random_vote_pred <- predict_party(nb_models, random_vote_df)
+random_vote_pred
+```
