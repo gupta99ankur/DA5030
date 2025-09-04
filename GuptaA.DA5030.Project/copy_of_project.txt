@@ -1,0 +1,551 @@
+---
+title: "An Ensemble of XXXXXXXXXXXXXXXXXXX"
+author: "Gupta, Ankur"
+date: "Summer 2025"
+output:
+  html_document:
+    df_print: paged
+subtitle: DA5030
+---
+```{r Load Libraries}
+library(psych)
+library(caret)
+library(randomForest)
+library(class)
+```
+
+## Data Explanation, Aquisition, and Exploration
+
+### Project Explanation and Data Loading
+
+- This project will create a heterozygous maching learning ensemble consisting of a Random Forest Tree, kNN, and Logistic Regression models to predict the presence of gallstone from the following dataset: https://www.kaggle.com/datasets/fatemehmohammadinia/gallstone-dataset/data
+
+- This dataset has been previously analyzed by [[[AUTHOR]]] (https://www.kaggle.com/code/fatemehmohammadinia/clinical-data-analysis-of-gallstone-disease) where XXXX explored the data, but did not attempt to create a model to predict gallstone presence. 
+
+- This project will create three homozygous models using bagging, then combine them into a single heterozygous ensemble. The models will be assessed using accuracy, confusion matrix, and f1-score.
+
+```{r LoadData}
+df <- read.csv("dataset-uci.csv", stringsAsFactors = F, header = T)
+```
+
+### Data Exploration
+
+```{r Exploration 1}
+head(df, 5)
+str(df)
+nrow(df)
+ncol(df)
+table(df$Gallstone.Status) 
+```
+Our dataset contains `r nrow(df)` observations, `r ncol(df)-1 ` features and our target variable 'Gallstone.Status', which categorically indicates the presence of gallstone or not (1 or 0).
+```{r MissingValues}
+which(is.na(df))
+```
+There are also no missing values in the dataset.
+
+There also appears to be several cateogrical features:
+```{r CateogricalFeatures}
+all_feature_names <- setdiff(colnames(df), 'Gallstone.Status')
+categorical_features <- character()
+
+for (feature in all_feature_names){
+  table_temp <- table(df[feature])
+  
+  if (length(table_temp) <= 2){
+    categorical_features <- c(categorical_features, feature)
+    print(table_temp)
+  }
+}
+
+```
+
+There are `r length(categorical_features)` categorical features in the dataset: `r categorical_features`. Importantly, the feature Hepatic Fat Accumulation (HFA), though scales from 0~4 discretely, also is categorical in nature - any value above 0 denotes presence of hepatic fat. Therefore, this feature can be treated as categorical if future model optimization is required. However, we will treat it as numeric but discrete and ordinal for now.
+
+Now let us inspect the numeric features in the dataset by looking it the spread:
+```{r ContinousFeatures}
+numeric_features <- setdiff(all_feature_names, categorical_features)
+
+for(feature in numeric_features){
+  
+  hist(df[,feature],
+       main = feature,
+       col = "lightblue")
+}
+```
+
+#### Assessment of Multicollinearity
+
+A logistic regression and kNN models both require multicollinerity to be eliminated from the dataset. Therefore, we will assess the multicollinearity of the dataset and deal with it accordingly.
+
+```{r Multicollinearity}
+cor_mat <- cor(df)
+high_corr <- which(cor_mat > 0.8 & cor_mat < 1, arr.ind = TRUE)
+
+multicollineairty <- data.frame(
+  Var1 = rownames(cor_mat)[high_corr[, 1]],
+  Var2 = colnames(cor_mat)[high_corr[, 2]],
+  Correlation = cor_mat[high_corr]
+)
+unique(multicollineairty[[1]])
+```
+We can see that there many, if not most, of the features are highly correlated with each other - `r nrow(unique(multicollineairty[1]))` have multicollinearity. This, however, is expected given the features themselves. For example, there are features denoting AST and ALT - markers of liver enzymes. These markers are often extremely correlated in individuals. Similarly, there are also features denoting cholesteral levels - Total Cholesterol and LDL. Like the liver enzymes, these are also high correlated. 
+
+For our random forest tree, high multicollinearity will not pose a problem. However, for our kNN and logisitic regression models, we will need to combine these features using a PCA plot when we shape the data.
+
+## Random Forest Tree
+
+Random Forest Tree models are very versatile models.
+
+### Shaping Dataset for Random Forest Tree
+
+There are no significant requirements for random forest trees. For our data, the major requirement is that the dataset has no missing values - which we have confirmed earlier. We will prepare the data by converting all the target variables to factors and one-shot encoding Gender.
+
+```{r ShapingForRandomForestTree}
+df_rf <- df
+
+# Convert target variable to factor
+df_rf$Gallstone.Status <- as.factor(df_rf$Gallstone.Status)
+
+df_rf$Female <- ifelse(df_rf$Gender == 0, 1, 0)
+df_rf$Male <- ifelse(df_rf$Gender == 1, 1, 0)
+
+df_rf$Gender <- NULL
+
+
+```
+### Random Forest Tree Model - Splitting
+
+We will split the dataset with a 0.8~0.2 split:
+```{r RFT_Splitting}
+set.seed(123)  # For reproducibility
+
+# Stratified train-test split (80% train, 20% test)
+train_index <- createDataPartition(df_rf$Gallstone.Status, p = 0.8, list = FALSE)
+
+train_data <- df_rf[train_index, ]
+test_data  <- df_rf[-train_index, ]
+```
+
+### Training Random Forest Model
+
+Now that we have properly shaped encoded the dataset for a Random Forest Tree, we will now train a model using a k-fold cross validation of k=5. This will provide a robust estimate for the overall accuracy of the model, particularly important given the
+
+```{r EvaluateModelFunction}
+evaluate_model <- function(predictions, actual){
+  conf_mat <- table(Predicted = predictions, Actual = actual)
+  
+  TP <- conf_mat["1", "1"]
+  TN <- conf_mat["0", "0"]
+  FP <- conf_mat["1", "0"]
+  FN <- conf_mat["0", "1"]
+  
+  precision <- TP / (TP + FP)
+  recall <- TP / (TP + FN)
+  f1_score <- 2 * precision * recall / (precision + recall)
+  
+  accuracy <- (TP + TN) / (TP + TN + FP + FN)
+  
+  list(conf_mat = conf_mat, f1_score = f1_score, accuracy = accuracy)
+}
+```
+
+
+```{r K-FoldRandomForestTreeFunction}
+# K-fold Evaluation
+cross_validate_rf <- function(data, mtry_val, ntree_val, k = 5, seed = 123) {
+  set.seed(seed)
+  folds <- caret::createFolds(data$Gallstone.Status, k = k, list = TRUE, returnTrain = FALSE)
+  
+  fold_metrics <- data.frame(Fold = integer(), Accuracy = numeric(), F1_Score = numeric())
+  
+  for (i in seq_along(folds)) {
+    test_idx <- folds[[i]]
+    train_data <- data[-test_idx, ]
+    test_data <- data[test_idx, ]
+    
+    # Train RF
+    rf_model <- randomForest(Gallstone.Status ~ ., data = train_data,
+                             mtry = mtry_val, ntree = ntree_val)
+    
+    # Predict on test fold
+    preds <- predict(rf_model, newdata = test_data)
+    
+    # Evaluate
+    eval <- evaluate_model(preds, test_data$Gallstone.Status)
+    
+    fold_metrics <- rbind(fold_metrics, data.frame(
+      Fold = i,
+      Accuracy = eval$accuracy,
+      F1_Score = eval$f1_score
+    ))
+  }
+  
+  return(fold_metrics)
+}
+
+
+```
+
+```{r HyperparameterizingRandomForestTree}
+ntree_values <- c(100, 300, 500)
+
+mtry_values <- c(2:16)
+
+# Store evaluation metrics
+k_fold_tuning <- data.frame()
+
+set.seed(123)
+for (nt in ntree_values) {
+  for (m in mtry_values) {
+    # Train model
+    results<- cross_validate_rf(df_rf, mtry_val = m, ntree_val = nt)
+
+    k_fold_tuning <- rbind(k_fold_tuning, data.frame(
+      ntree = nt,
+      mtry = m,
+      Accuracy = mean(results$Accuracy),
+      F1_Score = mean(results$F1_Score)))
+  }
+}
+
+print(k_fold_tuning)
+
+
+# Unique ntree values
+k_fold_tuning <- k_fold_tuning[order(k_fold_tuning$mtry), ]
+
+indexes_ntry_results <- list(which(k_fold_tuning$ntree == 100),
+                             which(k_fold_tuning$ntree == 300),
+                             which(k_fold_tuning$ntree == 500))
+
+for(i in 1:3){
+  tree <- k_fold_tuning[indexes_ntry_results[[i]],]
+  plot(tree$mtry, tree$Accuracy,
+     type = "o", col = "blue", pch = 16,
+     ylim = range(c(tree$Accuracy, tree$F1_Score)),
+     xlab = "mtry",
+     ylab = "Score",
+     main = paste0("Performance Metrics for ntree = ", ntree_values[i]))
+
+# Add F1 Score line
+lines(tree$mtry, tree$F1_Score,
+      type = "o", col = "darkgreen", pch = 17)
+
+# Add legend
+legend("bottomright",
+       legend = c("Accuracy", "F1 Score"),
+       col = c("blue", "darkgreen"),
+       pch = c(16, 17),
+       lty = 1)
+  
+}
+
+max_index <- which.max(k_fold_tuning$Accuracy + k_fold_tuning$F1_Score)
+rft_best_para <- k_fold_tuning[max_index,]
+
+rft_best_para
+rft_best_para$ntree
+rft_best_para$mtry
+```
+
+After plotting all the ntree and mtry values, we can establish that the number of trees is `r rft_best_para$ntree`, and the best number of features to consider is `r rft_best_para$mtry` for our random forest tree model. This provides an overall accuracy of 
+`r rft_best_para$Accuracy` and an f1-score of `r rft_best_para$F1_Score`.
+
+## K-Nearist Neighbor (kNN)
+
+We will now move onto creating a heterogenous kNN model, with bagging, for our heterogenous ensemble. We will first need to shape and encode the data for kNN. We will do the following:
+
+### Shaping Dataset for kNN
+
+We will shape the dataset in the following orders:
+
+- Remove outliers (using z-score)
+- Normalize all numeric features
+- Encode categorical features
+
+As there are no missing values in the dataset, there is no need to impute any values.
+
+#### Outlier Detection, Removal, and Normalization
+
+```{r NormalizationAndOutlierAssessment}
+# Normalization of numeric features
+target_index <- which(colnames(df_rf) == 'Gallstone.Status')
+df_scaled <- df_rf  # Because we want to keep gender encoding done previously
+df_scaled[numeric_features] <- scale(df_rf[numeric_features])
+
+head(df_scaled, 5)
+
+outliers_rows <- which(apply(df_scaled[-target_index] >= 3.5, 1, any))
+
+length(outliers_rows)
+```
+Here we identify that there are `r length(outlier_rows)` outliers using a z-score cut-off of >= 3.5. Removal of outliers:
+
+```{r OutlierRemoval}
+df_kNN <- df_scaled[-outliers_rows,]
+
+which(df_kNN[-target_index] >= 3.5)
+```
+
+#### Encoding Cateogorical Features
+
+Now that we have detected and removed outliers, and normalized the dataset, we can encode our categorical features. Fortunately, except for gender, all categorical features are defaulty in a numeric form.
+```{r}
+str(df_kNN)
+```
+
+### kNN Model Model Creation, with Bagging
+
+#### Splitting Dataset for Model
+
+We will create a 0.8~0.2 training to validating subset of our data for our kNN model.  
+
+```{r kNNSplitting}
+set.seed(123)
+
+# Split into training and test sets
+train_idx <- createDataPartition(df_kNN$Gallstone.Status, p = 0.8, list = FALSE)
+train_data <- df_kNN[train_idx, ]
+test_data <- df_kNN[-train_idx, ]
+
+```
+
+#### Bagging and Model Creation
+
+```{r kNNModelCreation}
+# Bagging parameters
+
+bagged_kNN_eval <- function(train_data, test_data, k_val = 10, num_bags = 9) {
+  # Collect predictions
+  all_predictions <- matrix(NA, nrow = nrow(test_data), ncol = num_bags)
+  
+  for (i in 1:num_bags) {
+    set.seed(200)
+    # Bootstrap sample from training data
+    boot_idx <- sample(1:nrow(train_data), replace = TRUE)
+    boot_data <- train_data[boot_idx, ]
+    
+    # Extract predictors and labels
+    x_train <- boot_data[, -which(names(boot_data) == "Gallstone.Status")]
+    y_train <- boot_data$Gallstone.Status
+    
+    x_test <- test_data[, -which(names(test_data) == "Gallstone.Status")]
+    
+    # kNN prediction
+    preds <- class::knn(train = x_train, test = x_test, cl = y_train, k = k_val)
+    all_predictions[, i] <- as.integer(as.character(preds))  # Ensure numeric 0/1
+  }
+  
+  # Majority vote across all bagged models
+  final_predictions <- apply(all_predictions, 1, function(x) {
+    ifelse(mean(x) > 0.5, 1, 0)
+  })
+  
+  # Evaluate
+  eval <- evaluate_model(final_predictions, test_data$Gallstone.Status)
+  
+  return(list(
+    k = k_val,
+    accuracy = eval$accuracy,
+    f1_score = eval$f1_score
+  ))
+}
+
+```
+
+```{r kNNHyperparameterizing}
+
+kNN_tuning <- data.frame()
+kNN_values <- seq(3, 19, by = 2)
+
+for (i in kNN_values){
+  kNN_tune_result <- bagged_kNN_eval(df_kNN, test_data, k_val = i, num_bags = 30)
+  
+  kNN_tuning <- rbind(kNN_tuning, data.frame(
+    k = i,
+    Accuracy = kNN_tune_result$accuracy,
+    F1_Score = kNN_tune_result$f1_score    
+  ))
+}
+
+print(kNN_tuning)
+
+max_index <- which.max(kNN_tuning$Accuracy + kNN_tuning$F1_Score)
+kNN_best_para <- kNN_tuning[max_index,]
+
+kNN_best_para
+kNN_best_para$k
+```
+
+After employing bagging, we can determine our best kNN model uses a k value of `r kNN_best_para$k`, with an accuracy of `r kNN_best_para$Accuracy` and an f1-score of `r kNN_best_para$F1_Score`
+
+## Logistic Regression Model
+
+To create the logisitic regression model, the data must be shaped appropriately. Many of the transformations were done previously for the kNN model. However, as determined during the exploration step, many of the features are highly correlated. Therefore, these features must be combined or engineered together. We will employ PCA plots to determine all correlated feature clusters.
+
+We will proceed by considering the following:
+
+- Remove outliers (but with non-normalized dataset)
+- Encode categorical features
+- Combine highly correlated features
+
+#### Outliers and Encoding Categorical Features
+
+As we have determined the outliers previously, we will utilize an un-normalized dataset and remove its outliers for our logisitic regression model.
+
+```{r GLMOutlier}
+df_glm_outlier <- df_rf[-outliers_rows,]
+```
+Since our previous variable as already encoded our categorical features, we need only remove the outliers from the dataset.
+
+#### Multicollinearity - PCA Plots
+
+```{r}
+
+# Set correlation threshold
+threshold <- 0.8
+cor_mat <- cor(df_glm_outlier[-1])
+# Get adjacency matrix for absolute correlation > threshold (and < 1 to avoid self-correlation)
+adj_mat <- abs(cor_mat) > threshold & abs(cor_mat) < 1
+
+# Initialize
+vars <- colnames(adj_mat)
+visited <- setNames(rep(FALSE, length(vars)), vars)
+groups <- list()
+
+# DFS function to find all connected nodes
+dfs <- function(node, adj_mat, visited) {
+  group <- c(node)
+  visited[node] <- TRUE
+  
+  neighbors <- names(which(adj_mat[node, ] & !visited))
+  
+  for (neighbor in neighbors) {
+    if (!visited[neighbor]) {
+      res <- dfs(neighbor, adj_mat, visited)
+      group <- unique(c(group, res$group))
+      visited <- res$visited
+    }
+  }
+  return(list(group = group, visited = visited))
+}
+
+# Build groups using DFS
+for (var in vars) {
+  if (!visited[var]) {
+    res <- dfs(var, adj_mat, visited)
+    groups[[length(groups) + 1]] <- res$group
+    visited <- res$visited
+  }
+}
+
+# Filter out trivial groups (with only one variable)
+groups <- groups[sapply(groups, length) > 1]
+
+# Print groups
+for (i in seq_along(groups)) {
+  cat(paste0("Group ", i, ": "), paste(groups[[i]], collapse = ", "), "\n")
+}
+
+```
+```{r}
+# Make a copy to preserve the original
+df_avg_reduced <- df_glm_outlier
+
+# Loop through each group of correlated variables
+for (i in seq_along(groups)) {
+  group_vars <- groups[[i]]
+  
+  # Ensure all variables in group exist in the dataframe
+  group_vars <- group_vars[group_vars %in% colnames(df_avg_reduced)]
+  
+  # Calculate row-wise average of the group
+  avg_feature <- rowMeans(df_avg_reduced[, group_vars], na.rm = TRUE)
+  
+  # Name the new averaged feature
+  new_col_name <- paste0("Avg_Group", i)
+  
+  # Add the new averaged column
+  df_avg_reduced[[new_col_name]] <- avg_feature
+  
+  # Drop the original group columns
+  df_avg_reduced <- df_avg_reduced[, !(colnames(df_avg_reduced) %in% group_vars)]
+}
+
+```
+
+### Logisitic Regression Model Creation and Evaluation
+
+Now that we have removed all outliers, encoded categorical features, and combined highly correlated features, we can create, evaluate the regression model.
+
+```{r}
+
+# Ensure target is factor (if not already)
+df_avg_reduced$Gallstone.Status <- as.factor(df_avg_reduced$Gallstone.Status)
+
+train_idx <- createDataPartition(df_avg_reduced$Gallstone.Status, p = 0.8, list = FALSE)
+train_data <- df_avg_reduced[train_idx, ]
+test_data <- df_avg_reduced[-train_idx, ]
+
+
+run_bagged_glm <- function(train_data, test_data, target_var, feature_vars, num_bags = 15) {
+  set.seed(123)
+
+  formula_str <- paste(target_var, "~", paste(feature_vars, collapse = " + "))
+  formula <- as.formula(formula_str)
+  
+  # Matrix to store predicted probabilities
+  all_pred_probs <- matrix(NA, nrow = nrow(test_data), ncol = num_bags)
+  
+  for (i in 1:num_bags) {
+    # Bootstrap sample
+    boot_idx <- sample(1:nrow(train_data), replace = TRUE)
+    boot_data <- train_data[boot_idx, ]
+    
+    # Fit logistic regression
+    glm_model <- glm(formula, data = boot_data, family = binomial)
+    
+    # Predict probabilities on test set
+    pred_probs <- predict(glm_model, newdata = test_data, type = "response")
+    all_pred_probs[, i] <- pred_probs
+  }
+  
+  # Average predictions
+  avg_pred_probs <- rowMeans(all_pred_probs)
+  
+  # Final class predictions using 0.5 threshold
+  final_predictions <- ifelse(avg_pred_probs > 0.5, 1, 0)
+  
+  # Evaluate
+  evaluation <- evaluate_model(final_predictions, test_data[[target_var]])
+  
+  # Return output
+  return(list(
+    model = glm_model,
+    evaluation = evaluation,
+    predictions = final_predictions,
+    avg_probabilities = avg_pred_probs,
+    formula_used = formula_str
+  ))
+}
+
+glm_result <- run_bagged_glm(train_data, test_data, target_var = "Gallstone.Status", 
+                         feature_vars = colnames(df_avg_reduced[-1]), num_bags = 10)
+glm_result$evaluation
+
+```
+
+
+```{r}
+glm_model_sum <- summary(glm_result$model)
+
+coefs <- glm_model_sum$coefficients
+
+significant_terms <- rownames(coefs[coefs[, "Pr(>|z|)"] < 0.10, ])[-1]
+
+glm_result_reduced <- run_bagged_glm(train_data, test_data, target_var = "Gallstone.Status", 
+                         feature_vars = significant_terms, num_bags = 10)
+
+glm_result_reduced$evaluation
+```
+

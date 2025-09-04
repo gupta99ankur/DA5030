@@ -1,0 +1,930 @@
+---
+title: "An Ensemble Model to Predict the Presence of Gallstones: Development and Evaluation"
+author: "Gupta, Ankur"
+date: "Summer 2025"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+subtitle: DA5030
+---
+```{r Load Libraries}
+library(psych)
+library(caret)
+library(randomForest)
+library(class)
+library(glmnet)
+library(dplyr)
+```
+
+## Data Explanation, Aquisition, and Exploration
+
+### Project Explanation and Data Loading
+
+- This project will create a heterozygous maching learning ensemble consisting of a Random Forest Tree, kNN, and Logistic Regression models to predict the presence of gallstone from the following dataset: https://www.kaggle.com/datasets/fatemehmohammadinia/gallstone-dataset/data
+
+- This dataset has been previously analyzed by [[[AUTHOR]]] (https://www.kaggle.com/code/fatemehmohammadinia/clinical-data-analysis-of-gallstone-disease) where XXXX explored the data, but did not attempt to create a model to predict gallstone presence. 
+
+- This project will create three homozygous models using bagging, then combine them into a single heterozygous ensemble. The models will be assessed using accuracy, confusion matrix, and f1-score.
+
+```{r LoadData}
+df <- read.csv("https://raw.githubusercontent.com/gupta99ankur/DA5030/main/dataset-uci.csv", stringsAsFactors = FALSE, header = TRUE)
+```
+
+### Data Exploration
+
+```{r Exploration}
+head(df, 5)
+str(df)
+nrow(df)
+ncol(df)
+table(df$Gallstone.Status) 
+```
+Our dataset contains `r nrow(df)` observations, `r ncol(df)-1 ` features and our target variable 'Gallstone.Status', which categorically indicates the presence of gallstone or not (1 or 0). Furthermore, there is no class imbalance for our target variable, Gallstone.Status.
+
+Most of the features appear to be numeric, with several several categorical features.
+
+#### Missing Values
+
+Now lets assess missing values:
+
+```{r MissingValues}
+which(is.na(df))
+```
+Because we know there are no characters in any of the features, we can conclude that there are no missing values in the dataset. Although this is ideal, to ensure robustness of our model (and for project requirements), we will randomly delete data later in this project.
+
+#### Categorical Features and Class Imbalance
+
+We identified previously that there are several categorical features. Now, we will look at them more deeply, in particular, assess their class imbalance:
+
+
+```{r CateogricalFeatures}
+all_feature_names <- setdiff(colnames(df), 'Gallstone.Status')
+categorical_features <- character()
+
+for (feature in all_feature_names){
+  table_temp <- table(df[feature])
+  
+  if (length(table_temp) <= 2){
+    categorical_features <- c(categorical_features, feature)
+    print(table_temp)
+  }
+}
+
+```
+
+There are `r length(categorical_features)` categorical features in the dataset: `r categorical_features`. Importantly, the feature Hepatic Fat Accumulation (HFA), although scales from 0~4 discretely, also is categorical in nature - any value above 0 denotes presence of hepatic fat (as described by the author of the data). Therefore, this feature can be treated as categorical if future model optimization is required. However, we will treat it as numeric but discrete and ordinal for now.
+
+Furthermore, we also see that many of the categorical features are extremely imbalanced, in particular: hypothyroidism and hyperlipidemia. Although these are features, and not our target variable, they can pose significant issue depending upon the models used. For example, if one feature is strongly correlated with the presence of gallstones and it is strongly imbalanced, our models will over- or under-predict classification when using that feature.
+
+Let us inspect the categorical features in question more by comparing them to our target feature:
+
+```{r ClassImbalance}
+
+# Convert to data.frame for ggplot
+table(df$Hyperlipidemia, df$Gallstone.Status)
+```
+
+Here we see that all observations, or patients, with hyperlipidemia have gallstones. This will pose significant issues for our models as it well strongly predict gallstones for any patients with hyperlipidemia. From domain knowledge, we know that hyperlipidemia is not a test to diagnose gallstones, therefore, if this model is applied to new data, there will be patients that have hyperlipidemia without gallstones. Our models would either be unable to, or find it difficult to accuratly predict their gallstone status. Furthermore, this class imbalance will inflate our models' evaluation.
+
+Since there are no examples of patients with hyperlipidemia but without gallstones, we will choose to not utilize this feature.
+
+Assessing Hypothyroidism:
+```{r ClassImbalance2}
+table(df$Hypothyroidism, df$Gallstone.Status)
+
+```
+
+In the case of hypothyroidism, do not see a relationship between hypothyroidism and gallstone status. Therefore, we do need to inherently remove it like hyperlipidemia. Instead, we can prioritize models that can tolerate rare cases.
+
+Finally, let us look at gender and diabetes status:
+```{r}
+table(df$Gender, df$Gallstone.Status)
+table(df$Diabetes.Mellitus..DM., df$Gallstone.Status)
+
+```
+
+For both gender and diabetes, there are minimal class imbalances with respect to gallstone status - i.e. there are all cases exist. Like hypothyroidism, it would be ideal to utilize models that can tolerate rarer cases.
+
+#### Numeric Feature Inspection
+
+Now let us inspect the numeric features in the dataset by looking it the distribution:
+```{r ContinousFeatures}
+numeric_features <- setdiff(all_feature_names, categorical_features)
+
+for(feature in numeric_features){
+  
+  hist(df[,feature],
+       main = feature,
+       col = "lightblue")
+}
+```
+
+Here, we can see many features appear to be distributed normally, but many features are also right-skewed. 
+
+Given the number of features and the number of skewed features, we will assess skewedness using the following formula (the adjusted Fisher-Pearson standardized moment coefficient): *
+$$
+\text{skewness} = \frac{n}{(n-1)(n-2)} \sum_{i=1}^{n} \left(\frac{x_i - \bar{x}}{s}\right)^3
+$$
+
+where:
+
+- \( n \) is the number of observations,
+- \( \bar{x} \) is the sample mean,
+- \( s \) is the sample standard deviation,
+- and \( x_i \) is the \( i^{th} \) observation.
+
+* Formula acquired using online sources, https://www.itl.nist.gov/div898/handbook/eda/section3/eda35b.htm, and created usingchatgpt.com
+
+```{r SkewednessAssessment}
+skewness_base <- function(x) {
+  n <- length(x)
+  m <- mean(x)
+  s <- sd(x)
+  sum(((x - m)/s)^3) * (n / ((n - 1) * (n - 2)))
+}
+
+skewness_values <- sapply(df[, numeric_features], skewness_base)
+
+skew_df <- data.frame(
+  Feature = names(skewness_values),
+  Skewness = skewness_values
+)
+rownames(skew_df) <- NULL
+head(skew_df, 5)
+
+```
+
+From the formula given above, we will determine skewness based upon a values greater than 1 or below -1. We will combine the results from the skewness formula and our visual inspection of the histograms to determine which features will need to be transformed.
+
+```{r AllSkewedFeatures}
+skewed_features <- skew_df[abs(skew_df$Skewness) > 1, ]
+
+print(skewed_features)
+```
+
+
+The skewness scores appears to appropriately classify skewedness of our features. However, there are some features that appear to be skewed because of outliers, in particular Obesity and Glomerular.Filtration.Rate..GFR. These features will likely become less skewed upon outlier removal. For example, in obesity, there is a single value at `r max(df$Obesity....)` when the reamining values are below 500. It quite possible this value is a typo - instead of `r max(df$Obesity....)`, it should be `r max(df$Obesity....)/10`. In comparison, for GFR, we see that the lowest value is at `r min(df$Glomerular.Filtration.Rate..GFR.)`, when the average is at `r mean(df$Glomerular.Filtration.Rate..GFR.)`. Importantly, patients with a GFR below 60 are considered to have kidney disease; a patient with a GFR value of 10 is extremely low. However, unlike feature obesity, we cannot acertain if this is a typo, or a similar error, or simply an outlier in the data. 
+
+For obesity, we will assume it was a reasonable error and impute them. However, for GFR as we cannot know for certain, we will leave the value as is.
+
+The remaining features, however, should be log transformed. Let us create a list for now:
+
+```{r FeaturesToLog}
+features_to_remove <- c("Obesity....")
+
+skewed_features_names <- setdiff(skewed_features$Feature, features_to_remove)
+
+skewed_features_subset <- skewed_features[skewed_features$Feature %in% skewed_features_names, ]
+
+```
+
+
+#### Assessment of Multicollinearity
+
+Many models have issues with multicollinearity, therefore, it is imperative to assess multicollinearity of our features before choosing which models to employ.
+
+```{r Multicollinearity}
+cor_mat <- cor(df)
+high_corr <- which(cor_mat > 0.8 & cor_mat < 1, arr.ind = TRUE)
+
+high_cor_df <- data.frame(
+  Var1 = rownames(cor_mat)[high_corr[, 1]],
+  Var2 = colnames(cor_mat)[high_corr[, 2]],
+  Correlation = cor_mat[high_corr]
+)
+high_cor_df
+
+```
+We can see that many features are highly correlated with each other - `r nrow(unique(high_cor_df[1]))` have multicollinearity. This, however, can be anticipated given the features themselves. For example, there are features denoting AST and ALT - markers of liver enzymes. These markers are often extremely correlated in individuals. Similarly, there are also features denoting cholesterol levels - Total Cholesterol and LDL. Like the liver enzymes, these are also commonly correlated. 
+
+The high multicollinearity between the features, however, poses problems. Some models require multicollinearity to be resolved to appropriately make predictions. This is further complicated in our dataset as there are groups of features that are correlated. A good example is feature "Total.Body.Water..TBW.". As seen in the table above, it appears`r sum(high_cor_df$Var2 == "Total.Body.Water..TBW.")` times. This means that many features are correleated with "Total.Body.Water..TBW.", and therefore there are several clusters. In order to combine these clusters, we can employ principle component analysis (PCA) to combine these features into several clusters, then use those combined clusters to train and make predictions.
+
+### Model Choice
+
+Given the data exploration, we need to choose three classification models. For this project, we will choose to utilize random forest trees, kNN, and ridge logistic regression models, as described below:
+
+#### Model Choice: Random Forest Tree
+
+Random forest trees are a classification model that handles multicollinearity, nonlinear relationships, and can tolerate outliers in our dataset. As such, it is an appropriate model for our requirements. 
+
+#### Model Choice: kNN
+
+kNN models are good classification models for robustness for our ensemble, as well as flexibility. Although kNN models do not require handling of multicollinearity, it will benefit from it. Therefore, for out kNN model, we will need to remove outliers, normalize,  log transform skewed features, and combine correlated features.
+
+#### Model Choice: Ridge Logistic Regression
+
+Regression provides a model variance for our entire ensemble. Further, ridge logistic regression can tolerate multicollinearity by using regularization coefficients to reduce the strength of large coefficients. For our ridge model, we will need to remove outliers, normalize, and log transform skewed features. Although we do not need to log transform our features, we will employ log transformation to improve its performance. Particularly because some features have strong right-skew.
+
+## Data Shaping/Transformation
+
+As mentioned during the data exploration phase, we have no missing values. For the requirements of this project, we will randomly remove datapoints in our dataset, and impute them.
+
+```{r CreateMissingValues}
+set.seed(123)  # For reproducibility
+
+df_with_na <- df  # Make a copy
+
+# Create dimensions excluding target feature
+total_values <- prod(dim(df_with_na[,-1]))
+num_NA <- round(total_values * 0.05)  # 5% missing
+
+na_indices <- sample(total_values, num_NA, replace = FALSE)
+
+row_indices <- ((na_indices - 1) %% nrow(df_with_na)) + 1
+col_indices <- ((na_indices - 1) %/% nrow(df_with_na)) + 1
+
+# Remove missing data across all features
+for (i in seq_along(na_indices)) {
+  df_with_na[row_indices[i]+1, col_indices[i]] <- NA
+}
+
+anyNA(df_with_na)
+head(df_with_na)
+```
+
+Here we can see that we randomly removed missing values from our dataset. Although we only created missing values in 5% of the dataset, we will need to remove outliers for our kNN and ridge regression model. Therefore, it is helpful to maintain as many datapoints as possible for our training and evaluation.
+
+To deal with missing values, we will impute them using the median. There are missing data across all features, instead of being concentrated in a single feature. Therefore, imputing values using the median will less likely introduce bias for each feature.
+
+```{r ImputeMissingValue}
+
+# Function to get mode for categorical features
+get_mode <- function(x) {
+  uniq_vals <- unique(x[!is.na(x)])
+  uniq_vals[which.max(tabulate(match(x, uniq_vals)))]
+}
+
+df_imputed <- df_with_na  # Copy dataframe with missing values
+
+for (col in names(df_imputed)) {
+  if (is.numeric(df_imputed[[col]])) {
+    median_val <- median(df_imputed[[col]], na.rm = TRUE)
+    df_imputed[[col]][is.na(df_imputed[[col]])] <- median_val
+  } else {
+    mode_val <- get_mode(df_imputed[[col]])
+    df_imputed[[col]][is.na(df_imputed[[col]])] <- mode_val
+  }
+}
+
+anyNA(df_imputed)
+
+```
+
+Now, we have successfully created and imputed our missing values.
+
+Imputing the maximum outlier in the obesity feature, assuming it is a typo and removing hyperlipidemia feature entirely (as explained in the exploration phase):
+```{r Impute}
+# For Obesity....: find the max value, then replace it with max/10
+max_val <- max(df_imputed$Obesity...., na.rm = TRUE)
+max_index <- which(df_imputed$Obesity.... == max_val)
+df_imputed$Obesity....[max_index] <- max_val / 10
+
+df_imputed$Hyperlipidemia <- NULL
+```
+
+
+### Random Forest Tree
+
+Random forest trees can handle multicollinearity, outliers, categorical features, and skewed features. As such, we only need to remove feature column hyperlipidemia as explained previously. 
+
+We will also factorize gallstone status, our target feature:
+
+```{r ShapingForRandomForestTree}
+df_rf <- df_imputed
+
+# Convert target variable to factor
+df_rf$Gallstone.Status <- as.factor(df_rf$Gallstone.Status)
+
+```
+
+### kNN
+
+#### Feature Transformation - Multicollinearity and Data Distribution
+
+kNN models are sensitive data to distribution (skewed data) and to multicollinearity. Therefore, we will transform the features first.
+
+We will use the skewed feature list we determine previously to decide which features to apply log transformation to:
+```{r SkewedFeatureTransformation}
+# Creaete log-transformed df copy
+df_trans <- df_rf  # Copy dataframe with factorization of target variable
+
+for (feature in skewed_features$Feature) {
+  df_trans[[feature]] <- log(df_trans[[feature]] + 1)
+  
+  hist(df_trans[,feature],
+       main = feature,
+       col = "lightblue")
+}
+# df_trans contains log-transformed dataframe
+```
+
+By assessing the distribution using histograms, we can see that the log transformed features are now more normally distributed. There are a few exceptions, most of them being due to outliers - for example GFR. However, the feature CRP is still substantially right-skewed, but better. Applying more transformations will be difficult, therefore, we will continue with this feature.
+
+
+
+We will proceed to deal with multicollinearity of the dataset using the previously determined correlated features.
+
+```{r MulticollinearitykNN}
+high_cor_features <- unique(high_cor_df$Var1)
+
+# 1. Extract the correlated features from df_log
+correlated_data <- df_trans[, high_cor_features]
+
+# 2. Run PCA on these features (center and scale recommended)
+pca_result <- prcomp(correlated_data, center = TRUE, scale. = TRUE)
+
+summary(pca_result)
+```
+
+Using the summary of our principle component analysis, we will choose the PCs so that it can account for roughly 90% of the variance. Given the PCA results, we will choose PC1~PC6 - as this accounts for majority of the variance.
+
+```{r Multicollinearity2}
+# Extract the first 5 PCs (multiple columns)
+pc_selected <- pca_result$x[, 1:6]
+
+# Remove the original correlated features from df_trans (make sure to use df_trans here)
+df_trans_reduced <- df_trans[, !(names(df_trans) %in% high_cor_features)]
+
+# Add the 5 PCs as new features with meaningful names
+pc_names <- paste0("PC", 1:5)
+df_trans_reduced[, pc_names] <- pc_selected
+
+```
+
+
+#### Outlier and Normalization
+
+Traditionally, a z-score cut-off of 3.0 is used for outlier detection and removal. However, if our outliers are true outliers (i.e true measurements but high in comparison to our data), removing all of them may prevent our kNN model from appriorpiately predicting patients with unusually high blood work. Therefore, we will use a 3.5 cut-off to remove outliers that will substantially impact our kNN model performance, but still maintain a realistic spread of variance.
+
+```{r NormalizationAndOutlierAssessment}
+# Normalization of numeric features
+target_index <- which(colnames(df_trans_reduced) == 'Gallstone.Status')
+df_scaled <- df_trans_reduced  # Because we want to keep gender encoding done previously
+
+# Find Numeric features by finding categorical features first:
+all_feature_names.trans <- setdiff(colnames(df_scaled), 'Gallstone.Status')
+categorical_features.trans <- character()
+
+for (feature in all_feature_names.trans){
+  table_temp <- table(df_trans_reduced[feature])
+  
+  if (length(table_temp) <= 2){
+    categorical_features.trans <- c(categorical_features.trans, feature)
+  }
+}
+
+numeric_features.trans <- setdiff(all_feature_names.trans, categorical_features.trans)
+
+# Scale only numeric features and remove outliers using z-score of 3.5
+df_scaled[numeric_features.trans] <- scale(df_trans_reduced[,numeric_features.trans])
+
+outliers_rows <- which(apply(abs(df_scaled[-target_index]) >= 3.5, 1, any))
+
+length(outliers_rows)
+```
+Here we identify that there are `r length(outliers_rows)` outliers using a z-score cut-off of >= 3.5. 
+
+To remove the outliers, we will first split the dataset into the training and testing dataset using the indexes created above. First, we need to remove the outlier row numbers from the train and test indexes, then separate the data into training and testing datasets. We will also need to ensure that our remaining training and testing datasets have a 0.8~0.2 ratio and have similar ratios for our target variable gallstone status.
+
+
+```{r OutlierRemovalAndNormalization}
+df_kNN <- df_trans_reduced[-outliers_rows,]
+df_kNN[numeric_features.trans] <- as.data.frame(scale(df_kNN[numeric_features.trans]))
+
+table(df_kNN$Gallstone.Status)
+```
+
+#### Encoding Cateogorical Features
+
+Now that we have detected and removed outliers, and normalized the dataset, we can encode our categorical features. Fortunately, except for gender, all categorical features are defaultly in a numeric form.
+
+We will employ a one-shot encoding for gender:
+```{r CategoricalFeatureskNN}
+df_kNN$Female <- ifelse(df_kNN$Gender == 0, 1, 0)
+df_kNN$Male <- ifelse(df_kNN$Gender == 1, 1, 0)
+
+# Optionally, you can remove the original Gender column if you don't need it anymore
+df_kNN$Gender <- NULL
+
+```
+
+### Ridge Logistic Regression
+
+For ridge logistic regression has several requirements that we need to shape:
+
+For this reason, we will scale our data frame and save it into a new variable df_ridge:
+
+```{r ShapeRidge}
+# df_trans contains log transformed features
+
+# Remove outliers
+z_scores <- scale(df_trans[,numeric_features])
+outlier_rows <- apply(abs(z_scores), 1, function(row) any(row > 3.5))
+df_pre_ridge <- df_trans[!outlier_rows, ]
+
+# Convert target to numeric
+df_pre_ridge$Gallstone.Status <- as.numeric(df_pre_ridge[[target_index]]) - 1
+
+# Scale dataframe
+df_ridge <- df_pre_ridge
+df_ridge[,numeric_features] <- scale(df_pre_ridge[,numeric_features])
+```
+
+## Homozygous Model Construction
+
+Now that we have shaped the data for each model, we will proceed to construct a homozygous ensemble using random forest trees, kNN, and ridge logistic regression. 
+
+### Random Forest Tree
+
+We will start with the random forest tree. Since random forest trees inherently use bagging, we will use the hold-out method to create our random forest tree model. To ensure that we have approrpiate target class balance, we will use the createDataPartition() function from the caret package. This will balance the number of positive and negative gallstone diagnoses in both the training and testing dataset.
+
+```{r RandomForestSplitting}
+train_index_rf <-  createDataPartition(df_rf$Gallstone.Status, p = 0.8, list = FALSE)
+train_df_rf <- df_rf[train_index_rf,]
+test_df_rf <- df_rf[-train_index_rf,]
+```
+
+#### Evaluation Function
+
+Before we continue, we will create an evaluation function that uses the predictions make by a model and the actual predictions to compute the accuracy, F1 score and a confusion matrix. This will provide us the ability to evaluate each individual model, and our ensemble.
+
+```{r EvaluateModelFunction}
+evaluate_model <- function(predictions, actual){
+  conf_mat <- table(Predicted = predictions, Actual = actual)
+  
+  TP <- conf_mat["1", "1"]
+  TN <- conf_mat["0", "0"]
+  FP <- conf_mat["1", "0"]
+  FN <- conf_mat["0", "1"]
+  
+  precision <- TP / (TP + FP)
+  recall <- TP / (TP + FN)
+  f1_score <- 2 * precision * recall / (precision + recall)
+  
+  accuracy <- (TP + TN) / (TP + TN + FP + FN)
+  
+  list(conf_mat = conf_mat, f1_score = f1_score, accuracy = accuracy)
+}
+```
+
+In order to optimize our random forest tree, we need to optimize the number of decision trees, parameter ntree, and the number of features to consider at each node, ntree. To do this, we will create a function that creates and evaluates a random forest tree, subsequently, we will find the optimal parameters to tune our model.
+
+```{r RandomForestTreeFunction}
+
+evaluate_rf <- function(train_data, test_data, mtry_val, ntree_val, seed = 123) {
+  set.seed(seed)
+
+  # Train RF
+  rf_model <- randomForest(Gallstone.Status ~ ., data = train_data,
+                             mtry = mtry_val, ntree = ntree_val)
+    
+  #Predict on test fold
+  preds <- predict(rf_model, newdata = test_data)
+    
+  # Evaluate
+  eval <- evaluate_model(preds, test_data$Gallstone.Status)
+  
+  fold_metrics <- data.frame(
+     Accuracy = eval$accuracy,
+     F1_Score = eval$f1_score,
+     Predictions = preds
+     
+    )
+   return(list(Accuracy = eval$accuracy,
+               F1_Score = eval$f1_score,
+               mtry = mtry_val,
+               ntree = ntree_val,
+               model = rf_model))
+  }
+```
+
+Let us see a sample usage of the function:
+```{r SampleFunctionUsage}
+sample_rf_eval <- evaluate_rf(train_df_rf, test_df_rf, mtry_val = 7, ntree_val = 300)
+sample_rf_eval
+```
+
+Here a basic random forest tree, without tuning, predicted a test set with `r sample_rf_eval$Accuracy` accuracy and `r sample_rf_eval$F1_Score` F1 Score using a mtree value of `r sample_rf_eval$mtry` and an ntree value of `r sample_rf_eval$ntree`.
+
+Now, we will hyperparameterize both the number of decision trees and the number of features. To start, we will pick a standard range of between 100~600 for the number of trees, and a range betwee 2~half of the total number of features:
+
+
+```{r HyperparameterizingRandomForestTree}
+ntree_values <- seq(100, 600, by = 100)
+
+mtry_values <- c(2:floor(ncol(df)/2))
+
+# Store evaluation metrics
+k_fold_tuning <- data.frame()
+k_tuning <- list()
+
+set.seed(123)
+for (nt in ntree_values) {
+  for (m in mtry_values) {
+    # Train model
+    eval_out <- evaluate_rf(train_df_rf, test_df_rf, mtry_val = m, ntree_val = nt)
+    
+    
+    k_fold_tuning <- rbind(k_fold_tuning, data.frame(
+      ntree = nt,
+      mtry = m,
+      Accuracy = mean(eval_out$Accuracy),
+      F1_Score = mean(eval_out$F1_Score)))
+    
+  }
+  
+}
+max_index <- which.max(k_fold_tuning$Accuracy + k_fold_tuning$F1_Score)
+rft_best_para <- k_fold_tuning[max_index,]
+
+rft_best_para
+```
+
+
+
+#### Final Random Forest Model
+
+Now that we have built the determine the best parameters for our random forest tree, we can construct the homozygous random forest tree model:
+
+```{r RandomForestTreeEnsemble}
+final_rf_model <- randomForest(Gallstone.Status ~ ., data = train_df_rf, mtry = rft_best_para$mtry, ntree = rft_best_para$ntree)
+```
+
+### kNN
+
+Unlike the random forest tree, the kNN does not inherently do bagging. Therefore, we will have to implement bagging to improve our mode. Furthermore, unlike random forest trees, we cannot create a 'model' that can be subsequently used with the prediciton function predict(). Instead, the knn() function requires both the training and testing dataset, and outputs the predictions. Therefore, when we construct our kNN ensemble, we must retain our training datasets we use in order to apply our testing dataset during our heterozygous ensemble.
+
+First, let us create a function that will take three parameters: training dataset, testing dataset, a k value, and the index for the target feature. Then, it will proceed to create a kNN model, evaluate it, and then return the evaluations and the predictions.
+
+```{r TrainkNNFunction}
+train_kNN <- function(train_df, test_df, k_val, target_index){
+  predictions <- knn(train = train_df[, -target_index], 
+                     test = test_df[, -target_index], 
+                     cl = train_df[[target_index]], 
+                     k = k_val)
+  
+  evaluation <- evaluate_model(predictions, test_df[[target_index]])
+  return(list(
+    Eval = evaluation,
+    Preds = predictions))
+}
+
+```
+
+Now that a kNN model function is created, let us create a function that determines the best k-value given a training dataset and testing dataset. This function will take a training dataframe, testing dataframe, a range of k-values, and the target index.
+
+```{r TuningKParameter}
+best_k_knn <- function(train_df, test_df, k_values, target_index){
+  
+  knn_tuning <- data.frame()
+  knn_evaluations <- list()
+  
+  for(k in k_values){
+    knn_eval_output <- train_kNN(train_df, test_df, k, target_index)
+
+    knn_eval <- knn_eval_output$Eval
+    
+    knn_tuning <- rbind(knn_tuning, data.frame(
+      k = k,
+      Accuracy = knn_eval$accuracy,
+      F1_Score = knn_eval$f1_score)
+      )
+  }
+  
+  best_index <- which.max(knn_tuning$Accuracy + knn_tuning$F1_Score)
+  
+  return(list(
+    Best_K = knn_tuning$k[best_index],
+    Accuracy = knn_tuning$Accuracy[best_index],
+    F1_Score = knn_tuning$F1_Score[best_index]
+    ))
+}
+
+kNN_indics <- createDataPartition(df_kNN$Gallstone.Status, p = 0.8, list = FALSE)
+train_kNN_df <- df_kNN[kNN_indics,]
+test_kNN_df <- df_kNN[-kNN_indics,]
+
+kNN_values <- seq(3, 19, by = 2)
+
+sample_knn_model <- best_k_knn(train_kNN_df, test_kNN_df, kNN_values, 1)
+sample_knn_model
+```
+
+Finally, let us create a function that takes an entire dataframe, in our case the dataset shaped for kNN, and split it n number of times into a 0.8~0.2 training to testing split. This function will in take a dataframe, a range of k_values, and the index of our target variable. It will return with the evaluation of the entire ensemble, and it will return with the training dataset subsets used for the model. This will ultimately create our kNN homozygous model, using bagging.
+
+```{r BaggingkNNAndEnsemble}
+kNN_bagged_models <- function(kNN_df, k_values, target_index, bag){
+  set.seed(123)
+  knn_evals <- data.frame()
+  data_frames <- list()
+  last_test_df <- NULL
+  
+  for (i in 1:bag) {
+    
+    indices <- createDataPartition(kNN_df[[target_index]], p = 0.8, list = FALSE)
+    train_df <- kNN_df[indices, ]
+    test_df <- kNN_df[-indices, ]
+
+    best_k_result <- best_k_knn(train_df, test_df, k_values, target_index)
+    
+    knn_evals <- rbind(knn_evals, data.frame(
+      Best_K = best_k_result$Best_K,
+    Accuracy = best_k_result$Accuracy,
+    F1_Score = best_k_result$F1_Score)
+    )
+    
+    data_frames[[i]] <- train_df
+    }
+  
+  return(list(
+    results = knn_evals,
+    data_frame = data_frames
+  ))
+}  
+ 
+
+kNN_models <- kNN_bagged_models(df_kNN, kNN_values, 1, 10)
+
+knn_accuracy_avg <- mean(kNN_models$results$Accuracy)
+knn_f1_score_avg <- mean(kNN_models$results$F1_Score)
+
+```
+
+Here we see that the overall accuracy of our homozygous knn ensemble is `r knn_accuracy_avg`, with an overall f1 score of `r knn_f1_score_avg`.
+
+Now we will build a function for the final ensemble, using the training dataframes each optimal k values. The function will take in the dataframes, the tuned k values, and a testing dataset.
+
+```{r kNNPredictionAndEnsemble}
+
+kNN_ensemble <- function(training_dfs, k_values, training_df, target_index){
+  # training_dfs must be a list of dataframes
+  # k_values must be a list of k values for each training dataframe
+  predictions <- list()
+  for (i in seq_along(k_values)){
+    kNN_model <- train_kNN(training_dfs[[i]], training_df, k_values[[i]], target_index)
+    preds <- kNN_model$Preds
+    
+    predictions[[i]] <- preds
+    
+  }
+  return(predictions)
+}
+
+# Sample usage of Ensemble
+ensemble <- kNN_ensemble(kNN_models$data_frame, kNN_models$results$Best_K, test_kNN_df, 1)
+head(ensemble, 5)
+```
+
+### Ridge Logistic Regression
+
+We move on to create the ridge logistic regression homologous model with bagging.
+
+Like with kNN, we will build a function to tune and hyperparameterize alpha for our ridge logistic regression. We can optimize our ridge regression by optimizing the alpha parameter. The alpha parameter is used to regulate the size of the coefficients on our dataset. Given that we have substantial multicollinearity in numerous feature, optimizing alpha (as well as using ridge logistic regression) is ideal.
+
+Below is a function that tests and optimizes alpha values for a given training and testing data set.
+
+```{r TuningRidgeAlpha}
+ridge_alpha_tuning <- function(train_df, test_df, a_range, target_index = 1){
+  set.seed(123)
+  mat_train_df <- as.matrix(train_df)
+  mat_test_df <- as.matrix(test_df)
+  
+  tuning_results <- data.frame()
+  models_list <- list()
+  
+  for (a in a_range) {
+    model <- cv.glmnet(
+      x = mat_train_df[, -target_index],
+      y = mat_train_df[, target_index],
+      alpha = a,
+      family = "binomial",
+      maxit = 1e6 
+    )
+    
+    best_lambda <- model$lambda.min
+    
+    pred_probs <- predict(model, s = best_lambda, newx = mat_test_df[, -target_index], type = "response")
+    
+    pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
+    
+    eval <- evaluate_model(pred_labels, mat_test_df[, target_index])
+    
+    tuning_results <- rbind(tuning_results, data.frame(
+      Alpha = a,
+      Accuracy = eval$accuracy,
+      F1_Score = eval$f1_score
+    ))
+    
+    models_list[[as.character(a)]] <- list(
+      Model = model,
+      Lambda = best_lambda,
+      Evaluation = eval,
+      Preds = pred_probs
+    )
+  }
+
+  # Select best alpha by Accuracy + F1 Score
+  tuning_results$Score <- tuning_results$Accuracy + tuning_results$F1_Score
+  best_alpha <- as.character(tuning_results$Alpha[which.max(tuning_results$Score)])
+  best_model_info <- models_list[[best_alpha]]
+  
+  return(list(
+    Alpha = as.numeric(best_alpha),
+    Accuracy = best_model_info$Evaluation$accuracy,
+    F1_Score = best_model_info$Evaluation$f1_score,
+    Model = best_model_info$Model
+  ))
+}
+```
+
+Let us test our function for optimizing k:
+
+```{r TestingRidgeAlphaFunction}
+set.seed(167)  # for reproducibility
+
+# Assuming your target variable is called 'target'
+ridge_train_index <- createDataPartition(df_ridge$Gallstone.Status, p = 0.8, list = FALSE)
+
+train_ridge_df <- df_ridge[ridge_train_index, ]
+test_ridge_df  <- df_ridge[-ridge_train_index, ]
+
+alpha_ranges <- seq(0, 1, by = 0.1)
+sample_ridge_tune <- ridge_alpha_tuning(train_ridge_df, test_ridge_df, alpha_ranges, 1)
+
+sample_ridge_tune
+```
+Here we can see that the function is working and provides the accuracy (`r sample_ridge_tune$Accuracy`), f1 score (`r sample_ridge_tune$F1_Score`), model, and the alpha value `r sample_ridge_tune$Alpha`.
+
+#### Ridge Bagging and Functions
+
+Now, we will create the ensemble with bagging:
+
+```{r RidgeBagging}
+
+ridge_bagging <- function(train_df, test_df, alpha_ranges, target_index = 1, bags = 10) {
+  models <- list()
+  
+  for (b in 1:bags) {
+    # Bootstrap sample of training data
+    indices <- sample(nrow(train_df), replace = TRUE)
+    boot_train_df <- train_df[indices, ]
+    
+    # Alpha tuning on bootstrap sample
+    ridge_model <- ridge_alpha_tuning(boot_train_df, test_df, alpha_ranges, target_index)
+    
+    # Store only the trained model
+    models[[b]] <- ridge_model$Model
+  }
+  
+  return(models)
+}
+
+
+ridge_models <- ridge_bagging(train_ridge_df, test_ridge_df, alpha_ranges, 1)
+
+
+```
+
+Finally, let us create a function to test each model for a different testing dataframe, ultimately creating the ensemble. This will be used later with to evaluate our ridge ensemble and combined with our other predictions to evaluate our entire ensemble.
+
+```{r EnsembleAssemble}
+predict_ridge_models <- function(ridge_models, test_df, target_index = 1) {
+  predictions_list <- vector("list", length(ridge_models))
+  
+  test_mat <- as.matrix(test_df[-1])
+  
+  for (i in seq_along(ridge_models)) {
+    model <- ridge_models[[i]]
+    
+    # Get best lambda for this model
+    lambda_best <- model$lambda.min
+    
+    # Predict probabilities on test set
+    preds <- predict(model, s = lambda_best, newx = test_mat, type = "response")
+    
+    # Save predictions
+    predictions_list[[i]] <- preds
+  }
+  
+  return(predictions_list)
+}
+
+# Test function:
+predictions_test <- predict_ridge_models(ridge_models, test_ridge_df, 1)
+length(predictions_test)
+```
+Here we can see that there are 10 predictions inside our ensemble.
+
+Now that we have created all three individual ensembles, we will proceed to create the hetereozygous ensemble.
+
+## Ensemble Creation and Evaluation
+
+To evaluate the entire ensemble, we will split the dataset into 1/5 (or a 0.8~0.2) ratio, and test the the entire ensemble on the testing split. We will shape the data as required for each dataset, and use the models created previously to create individual ensembles, then average all using a majority vote for the entire ensemble.
+
+Although the kNN model and ridge logistic regression requires removal of outliers, we will test the dataset without removing any. This is because the complete ensemble would, in theory, be used to predict gallstone status regardless if an individual patient has outlier tests. We need to acquire a realistic assessment of the entire ensemble. Therefore, we will not remove outliers.
+
+### Testing Data for Ensemble
+
+```{r SplittingForEntireEnsemble}
+
+set.seed(200)  # for reproducibility (optional)
+test_indices <- sample(nrow(df), size = 0.2 * nrow(df))
+
+# Since data preprocessing was done previously for each model, we can reuse the preprocessing
+rf_ensemble_test <- df_rf[test_indices,]
+
+# For kNN, we will need to reprocess the data so as to not remove the outliers.
+kNN_ensemble_test <- df_scaled[test_indices,]  # model in kNN before removal of outliers
+kNN_ensemble_test$Female <- ifelse(kNN_ensemble_test$Gender == 0, 1, 0)
+kNN_ensemble_test$Male <- ifelse(kNN_ensemble_test$Gender == 1, 1, 0)
+
+kNN_ensemble_test$Gender <- NULL
+
+# For Ridge, we will need to reprocess the data so as to not remove the outliers.
+
+ridge_ensemble_test <- df_trans[test_indices,] # model in ridge before removal of outliers and scaling
+ridge_ensemble_test[,numeric_features] <- scale(ridge_ensemble_test[,numeric_features])
+
+ensemble_target <- ridge_ensemble_test$Gallstone.Status
+```
+
+
+#### Individual Ensemble Assembly
+
+Let's create a function that takes a list of predictions and takes the majority vote. We will use this to compare each individual ensemble, and evaluate the entire ensemble.
+
+```{r EnsembleEvaluation}
+
+ensemble_probabilities <- function(prediction_list) {
+  
+  # Combine predictions into a matrix (rows = samples, columns = models)
+  pred_matrix <- sapply(prediction_list, function(x) as.numeric(as.character(x)))
+
+  # Convert values to numeric if they are factors or characters
+  pred_matrix_num <- apply(pred_matrix, 2, function(col) as.numeric(as.character(col)))
+  
+  # Calculate probabilities as row means
+  ensemble_probs <- rowMeans(pred_matrix_num)
+  
+  return(ensemble_probs)
+}
+
+```
+
+```{r IndividualEnsembles}
+ensem_prob_list <- list()
+
+# Random Forest Model saved in variable final_rf_model
+rf_pred_array <- predict(final_rf_model, newdata = rf_ensemble_test, type = "prob")
+rf_probs <- rf_pred_array[, "1"]  # Get list of predictions
+ensem_prob_list[[1]] <- rf_probs
+
+# Making Predictions using kNN
+kNN_prediction_list <- kNN_ensemble(kNN_models$data_frame, kNN_models$results$Best_K, kNN_ensemble_test, 1)
+kNN_probs <- ensemble_probabilities(kNN_prediction_list)
+ensem_prob_list[[2]] <- kNN_probs
+
+ridge_prediction_list <- predict_ridge_models(ridge_models, ridge_ensemble_test, 1)
+ridge_probs <- ensemble_probabilities(ridge_prediction_list)
+ensem_prob_list[[3]] <- ridge_probs
+
+ensemble_probs <- ensemble_probabilities(ensem_prob_list)
+
+```
+
+
+### Evaluate Models
+
+Now that we have created each ensemble, we will evaluate each model, create the entire ensemble using majority vote, and evaluate the overall ensemble.
+
+```{r EvaluateEnsembles}
+rf_prediction <- ifelse(rf_probs > 0.5, 1, 0)
+rf_eval <- evaluate_model(rf_prediction, ensemble_target)
+
+kNN_prediction <- ifelse(kNN_probs > 0.5, 1, 0)
+kNN_eval <- evaluate_model(kNN_prediction, ensemble_target)
+
+ridge_prediction <- ifelse(ridge_probs > 0.5, 1, 0)
+ridge_eval <- evaluate_model(ridge_prediction, ensemble_target)
+
+ensemble_prediction <- ifelse(ensemble_probs > 0.5, 1, 0)
+ensemble_eval <- evaluate_model(ensemble_prediction, ensemble_target)
+
+```
+
+
+Finally, we have created each individual model, and the final heterozygous ensemble. Our overall ensemble performed quite well: an accuracy of `r ensemble_eval$accuracy`, and an f1 score of `r ensemble_eval$f1_score`. However, our individual models's performance differed, with out random forest tree outperforming our ensemble: accuracy at `r rf_eval$accuracy` and an f1 score of `r rf_eval$f1_score`. 
+
+Below is a table comparing the performance of each individual model and the entire ensemble:
+
+```{r EvaluationEnsemble2}
+evaluation_df <- data.frame(
+  Models = c('Random Forest Tree', 'kNN', 'Ridge Logistic Regression', 'Entire Ensemble'),
+  Accuracy = c(rf_eval$accuracy, kNN_eval$accuracy, ridge_eval$accuracy, ensemble_eval$accuracy),
+  F1_Score = c(rf_eval$f1_score, kNN_eval$f1_score, ridge_eval$f1_score, ensemble_eval$f1_score)
+)
+evaluation_df
+```
+
+
